@@ -314,6 +314,7 @@ async def main() -> None:
     parser.add_argument("--effort", default="high", help="Reasoning effort")
     parser.add_argument("--dir", default="/root/reasonix-workspace", help="Reasonix workspace dir")
     parser.add_argument("--verbose-progress", action="store_true", help="Send detailed progress (thinking/tool) instead of just typing")
+    parser.add_argument("--prompt-suffix", default="", help="Extra instruction appended to Reasonix system prompt")
     args = parser.parse_args()
 
     setup_logging()
@@ -356,11 +357,16 @@ async def main() -> None:
         return
 
     # ACP config
+    system_append = args.prompt_suffix or (
+        "输出规范：回复时只输出最终答案和结论，不要在回复中附带推理过程。"
+        "思考过程请放在 reasoning_content 中。回复简洁、直接。"
+    )
     acp_config = AcpConfig(
         dir=args.dir,
         model=args.model,
         effort=args.effort,
         yolo=True,
+        system_append=system_append,
     )
 
     Path(args.dir).mkdir(parents=True, exist_ok=True)
