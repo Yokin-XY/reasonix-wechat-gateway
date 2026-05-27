@@ -250,12 +250,14 @@ class SessionManager:
         # Get or create ACP client
         client, was_recreated = await self.get_or_create_session(user_id)
 
-        # If session was just recreated (restart), inject history summary
-        if was_recreated:
+        # Inject history summary on restart, or if this is a fresh session with history
+        meta = self._history.load_meta(user_id)
+        if was_recreated or meta.turn_count == 0:
             summary = self._history.build_summary(user_id, max_turns=10)
             if summary:
-                text = f"{summary}\n\n---\n\n{text}"
-                logger.info("[session] Injected %d chars of history for %s", len(summary), user_id[:20])
+                text = f"【此前对话回顾】\n{summary}\n\n---\n\n{text}"
+                logger.info("[session] Injected %d chars history summary for %s (was_recreated=%s, turn_count=%s)",
+                            len(summary), user_id[:20], was_recreated, meta.turn_count)
 
         # Send prompt and collect response
         try:
