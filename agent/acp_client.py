@@ -63,6 +63,14 @@ class AcpClient:
         self._stop_reason: Optional[str] = None
         self._alive = False
 
+        # Progress tracking
+        self._last_activity_time: float = 0.0
+        self._last_progress_report: float = 0.0  # when we last sent a progress update
+        self._current_tool: Optional[str] = None
+        self._current_tool_status: Optional[str] = None
+        self._thinking_preview: str = ""
+        self._progress_status: str = "idle"  # idle | thinking | running_tool | waiting
+
     @property
     def session_id(self) -> Optional[str]:
         return self._session_id
@@ -70,6 +78,31 @@ class AcpClient:
     @property
     def alive(self) -> bool:
         return self._alive and self._process is not None and self._process.returncode is None
+
+    def get_progress(self) -> Optional[str]:
+        """Return a human-readable progress status, or None if idle.
+
+        Returns None when idle (no prompt running) so callers can skip.
+        """
+        now = time.time()
+        idle_seconds = now - self._last_activity_time
+
+        if self._progress_status == "idle":
+            return None
+
+        if idle_seconds > 120:
+            # No activity for 2+ minutes — might be stuck
+            return "⏳ 已无响应" + (f"（上次活动: {int(idle_seconds)}秒前）")
+
+        if self._progress_status == "running_tool" and self._current_tool:
+            if self._current_tool_status == "pending":
+                return f"🔧 准备执行: {self._current_tool}"
+            return f"🔧 正在执行: {self._current_tool}"
+        elif self._progress_status == "thinking" and self._thinking_preview:
+            preview = self._thinking_preview[:60]
+            return f"💭 思考中: {preview}..."
+
+        return "⏳ 处理中"
 
     async def start(self) -> bool:
         """Start the ACP subprocess. Returns True on success."""
@@ -329,17 +362,34 @@ class AcpClient:
                 text = content.get("text", "")
                 if text:
                     self._response_queue.put_nowait(text)
+
             elif update_type == "agent_thought_chunk":
-                # Reasoning/thinking — skip, don't include in response
-                pass
+                # Track thinking for progress reporting
+                content = update.get("content", {})
+                text = content.get("text", "")
+                if text:
+                    self._thinking_preview = text
+                    self._last_activity_time = time.time()
+                    self._progress_status = "thinking"
 
             elif update_type == "tool_call":
                 title = update.get("title", "")
                 status = update.get("status", "")
+                self._current_tool = title
+                self._current_tool_status = status
+                self._last_activity_time = time.time()
+                if status == "pending" or status == "in_progress":
+                    self._progress_status = "running_tool"
                 logger.debug("[acp] Tool: %s (%s)", title, status)
 
             elif update_type == "tool_call_update":
                 status = update.get("status", "")
+                self._current_tool_status = status
+                self._last_activity_time = time.time()
+                if status == "completed" or status == "failed":
+                    self._current_tool = None
+                    self._current_tool_status = None
+                    self._progress_status = "thinking"  # back to thinking
                 logger.debug("[acp] Tool update: %s", status)
 
         elif method == "session/request_permission":

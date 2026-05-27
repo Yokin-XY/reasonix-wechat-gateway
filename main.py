@@ -27,6 +27,7 @@ from adapter.types import MessageEvent
 from agent.acp_client import AcpConfig
 from agent.session_manager import SessionManager
 from agent.command_handler import parse_command, handle_command
+from agent.progress_monitor import ProgressMonitor
 
 logger = logging.getLogger("reasonix-gateway")
 
@@ -44,6 +45,8 @@ class ReasonixGateway:
         self._session_mgr = SessionManager(acp_config=acp_config)
         self._adapter: WeixinAdapter | None = None
         self._running = False
+        self._progress_chat_id: str = ""
+        self._progress = ProgressMonitor(send_fn=self._send_progress)
 
     async def start(self) -> None:
         """Start the gateway: connect WeChat adapter, begin processing."""
@@ -126,9 +129,15 @@ class ReasonixGateway:
 
         # Forward to Reasonix
         try:
+            # Set chat_id for progress reporting
+            self._progress_chat_id = chat_id
+            client = await self._session_mgr.get_or_create_session(user_id)
+            self._progress.start_for(client)
             reply = await self._session_mgr.send_message(user_id, text)
+            self._progress.stop()
             await self._send_reply(chat_id, reply)
         except Exception as exc:
+            self._progress.stop()
             logger.error("Error processing message from %s: %s", user_id, exc, exc_info=True)
             await self._send_reply(chat_id, f"处理消息时出错: {exc}")
 
@@ -164,6 +173,18 @@ class ReasonixGateway:
             logger.info("Media copied: %s → %s", src, dst)
 
         return "\n".join(parts) if parts else ""
+
+    def _send_progress(self, text: str) -> None:
+        """Send a progress message to WeChat (sync, fire-and-forget)."""
+        if not self._adapter or not self._progress_chat_id:
+            return
+        try:
+            # Fire-and-forget: progress shouldn't block main flow
+            asyncio.create_task(
+                self._adapter.send(self._progress_chat_id, text)
+            )
+        except Exception as exc:
+            logger.debug("[progress] send error: %s", exc)
 
     async def _send_reply(self, chat_id: str, text: str) -> None:
         """Send a reply via the WeChat adapter."""
