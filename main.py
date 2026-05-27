@@ -69,35 +69,10 @@ class ReasonixGateway:
             logger.error("Failed to connect WeChat adapter")
             return
 
-        # Send startup notification to last known user
+        # Send startup notification + pending shutdown delivery
         await self._notify_startup()
 
         logger.info("Gateway started. Waiting for messages...")
-
-    def _chat_file(self) -> Path:
-        return Path(os.path.expanduser("~/.reasonix-gateway")) / "last-chat.txt"
-
-    def _save_last_chat(self, chat_id: str) -> None:
-        try:
-            self._chat_file().write_text(chat_id, encoding="utf-8")
-        except Exception:
-            pass
-
-    def _load_last_chat(self) -> str:
-        try:
-            f = self._chat_file()
-            return f.read_text(encoding="utf-8").strip() if f.exists() else ""
-        except Exception:
-            return ""
-
-    async def _notify_startup(self) -> None:
-        """Send startup notification to the last known user."""
-        chat_id = self._load_last_chat()
-        if chat_id and self._adapter:
-            try:
-                await self._adapter.send(chat_id, "🟢 网关已重新启动，Reasonix 就绪。")
-            except Exception:
-                pass
 
         # Keep running until stopped
         try:
@@ -108,24 +83,105 @@ class ReasonixGateway:
         finally:
             await self.shutdown()
 
+    # --- Lifecycle notification helpers ---
+
+    def _state_path(self) -> str:
+        """Path for lifecycle flags (shutdown/restart)."""
+        return os.path.expanduser("~/.reasonix-gateway/state.json")
+
+    def _last_chat_path(self) -> str:
+        """Path for persisted last chat ID."""
+        return os.path.expanduser("~/.reasonix-gateway/last-chat.txt")
+
+    def _save_last_chat(self, chat_id: str) -> None:
+        try:
+            Path(self._last_chat_path()).write_text(chat_id, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_last_chat(self) -> str:
+        try:
+            f = Path(self._last_chat_path())
+            return f.read_text(encoding="utf-8").strip() if f.exists() else ""
+        except Exception:
+            return ""
+
+    def _save_shutdown_flag(self, chat_id: str) -> None:
+        """Write pending shutdown notification for delivery on next startup."""
+        try:
+            import json
+            Path(self._state_path()).write_text(
+                json.dumps({"type": "shutdown", "chat_id": chat_id, "text": "🔌 网关已关闭。"}),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _clear_shutdown_flag(self) -> None:
+        try:
+            Path(self._state_path()).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _load_pending_notification(self) -> dict:
+        try:
+            import json
+            f = Path(self._state_path())
+            if f.exists():
+                return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    async def _notify_startup(self) -> None:
+        """Send startup notification. Also delivers pending shutdown from crash."""
+        # Deliver pending shutdown first
+        pending = self._load_pending_notification()
+        if pending.get("type") == "shutdown":
+            cid = pending.get("chat_id", "")
+            txt = pending.get("text", "🔌 网关已关闭。")
+            if cid and self._adapter:
+                try:
+                    await self._adapter.send(cid, txt)
+                except Exception:
+                    pass
+
+        # Then startup notification
+        chat_id = self._load_last_chat()
+        if chat_id and self._adapter:
+            try:
+                await self._adapter.send(chat_id, "🟢 网关已重新启动，Reasonix 就绪。")
+            except Exception:
+                pass
+
     async def shutdown(self) -> None:
-        """Graceful shutdown."""
+        """Graceful shutdown with bypass for crash delivery."""
         logger.info("Shutting down gateway...")
         self._running = False
         if self._monitor:
             self._monitor.stop()
-        # Send shutdown notification to the last active chat
+
+        # Save shutdown flag to file (bypass: delivered on next startup if we die)
         chat_id = self._last_chat_id or self._load_last_chat()
-        if self._adapter and chat_id:
-            try:
-                await self._adapter.send(chat_id,
-                                         "🔌 网关即将关闭。")
-            except Exception:
-                pass
+        if chat_id:
+            self._save_shutdown_flag(chat_id)
+            # Try live send (3s timeout — may not complete if killed fast)
+            if self._adapter:
+                try:
+                    await asyncio.wait_for(
+                        self._adapter.send(chat_id, "🔌 网关即将关闭。"),
+                        timeout=3,
+                    )
+                    self._clear_shutdown_flag()
+                except Exception:
+                    logger.debug("[shutdown] live send failed, will deliver on next startup")
+
         if self._adapter:
             await self._adapter.disconnect()
         await self._session_mgr.shutdown_all()
         logger.info("Gateway stopped.")
+
+    # --- Message handling ---
 
     async def _handle_message(self, event: MessageEvent) -> None:
         """Handle an incoming WeChat message."""
@@ -147,7 +203,6 @@ class ReasonixGateway:
 
         # Track last chat for shutdown notification
         self._last_chat_id = chat_id
-        # Persist to disk so startup notification works across restarts
         self._save_last_chat(chat_id)
 
         logger.info("Message from %s: %s (media=%d)", user_id, text[:100], len(media_info))
@@ -158,13 +213,13 @@ class ReasonixGateway:
 
         # Check for slash commands
         cmd, args = parse_command(text)
-        if cmd and not media_info:  # Don't intercept commands with media
+        if cmd and not media_info:
             response = await handle_command(cmd, args, self._session_mgr, user_id)
             if response is not None:
                 await self._send_reply(chat_id, response)
                 return
 
-        # Send typing indicator (shows "对方正在输入..." in WeChat)
+        # Send typing indicator
         if self._adapter:
             try:
                 await self._adapter.send_typing(chat_id)
@@ -173,7 +228,6 @@ class ReasonixGateway:
 
         # Forward to Reasonix
         try:
-            # Create activity monitor: default refreshes typing, verbose adds details
             client = await self._session_mgr.get_or_create_session(user_id)
             typing_fn = lambda: asyncio.create_task(self._adapter.send_typing(chat_id)) if self._adapter else None
             progress_fn = (lambda t, c=chat_id: asyncio.create_task(self._adapter.send(c, t))) \
@@ -207,13 +261,10 @@ class ReasonixGateway:
             src = Path(url)
             if not src.exists():
                 continue
-            # Copy to workspace uploads
             dst = uploads_dir / src.name
             import shutil
             shutil.copy2(str(src), str(dst))
-            # Build info for Reasonix
             rel_path = f"uploads/{src.name}"
-            ext = src.suffix.lower()
             if mime.startswith("image/"):
                 parts.append(f"[图片文件] {rel_path}")
             elif mime.startswith("video/"):
@@ -226,15 +277,10 @@ class ReasonixGateway:
 
         return "\n".join(parts) if parts else ""
 
-    def _send_progress(self, text: str) -> None:
-        """Send a progress message to WeChat (fire-and-forget, unused in default mode)."""
-        pass  # Progress text is sent via the lambda in _handle_message if verbose
-
     async def _send_reply(self, chat_id: str, text: str) -> None:
         """Send a reply via the WeChat adapter."""
         if not self._adapter:
             return
-        # Log if MEDIA: tags are present
         if "MEDIA:" in text:
             import re
             media_tags = re.findall(r"MEDIA:(.+)", text)
@@ -293,7 +339,6 @@ async def main() -> None:
         "dm_policy": "open",
     }
 
-    # If no credentials given, try to load from persisted account
     if not weixin_config["account_id"]:
         from transport.account import load_weixin_account
         accounts_dir = Path(hermes_home) / "weixin" / "accounts"
@@ -318,7 +363,6 @@ async def main() -> None:
         yolo=True,
     )
 
-    # Ensure workspace dir exists
     Path(args.dir).mkdir(parents=True, exist_ok=True)
 
     # Start gateway
