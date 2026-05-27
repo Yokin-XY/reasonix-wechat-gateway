@@ -1,7 +1,9 @@
 """
-Reasonix Gateway — main entry point.
+Reasonix Gateway - main entry point.
 
 Bridges WeChat (via iLink Bot API) to Reasonix (via ACP protocol).
+Includes OOM protection, memory monitoring, and ACP reconnect watcher
+(ported from Hermes gateway's _platform_reconnect_watcher).
 
 Usage:
     python main.py                          # Start with default config
@@ -31,8 +33,21 @@ from agent.acp_client import AcpConfig
 from agent.session_manager import SessionManager
 from agent.command_handler import parse_command, handle_command
 from agent.activity_monitor import ActivityMonitor
+from memory_monitor import start_memory_monitoring, stop_memory_monitoring
 
 logger = logging.getLogger("reasonix-gateway")
+
+# --- OOM protection (from Hermes start-gateway.py) ---
+# Negative oom_score_adj makes the gateway harder for OOM killer to target.
+# -1000 = never kill, -500 = hard to kill, 0 = default.
+# Configure via REASONIX_GATEWAY_OOM_SCORE_ADJ env var.
+_OOM_SCORE_ADJ = int(os.environ.get("REASONIX_GATEWAY_OOM_SCORE_ADJ", "-500"))
+try:
+    with open(f"/proc/{os.getpid()}/oom_score_adj", "w") as f:
+        f.write(str(_OOM_SCORE_ADJ))
+    logger.info("[startup] oom_score_adj set to %s", _OOM_SCORE_ADJ)
+except Exception:
+    pass  # Non-Linux or restricted environment, harmless
 
 
 SESSION_ID_FILE = os.path.expanduser("~/.reasonix-gateway/session-id")
@@ -131,6 +146,12 @@ class ReasonixGateway:
         # Send session notification
         await self._notify_session()
 
+        # Start memory monitoring (from Hermes memory_monitor.py)
+        start_memory_monitoring()
+
+        # Start ACP reconnect watcher (from Hermes _platform_reconnect_watcher)
+        asyncio.create_task(self._acp_reconnect_watcher())
+
         logger.info("Gateway started. Waiting for messages...")
 
         # Keep running until stopped
@@ -193,7 +214,79 @@ class ReasonixGateway:
         if self._adapter:
             await self._adapter.disconnect()
         await self._session_mgr.shutdown_all()
+        stop_memory_monitoring()
         logger.info("Gateway stopped.")
+
+    # --- ACP reconnect watcher (from Hermes _platform_reconnect_watcher) ---
+    # Matches Hermes pattern: exponential backoff 30s->60s->120s->240s->300s cap.
+    # Gateway stays alive even with no ACP, watcher keeps retrying.
+    _ACP_RECONNECT_BACKOFF_CAP = 300  # 5 minutes max between retries
+    _ACP_RECONNECT_INITIAL_DELAY = 30  # seconds
+    _ACP_RECONNECT_PAUSE_AFTER = 10  # circuit-breaker threshold
+
+    async def _acp_reconnect_watcher(self) -> None:
+        """Background task that periodically checks the ACP process and reconnects if dead.
+
+        Ported from Hermes gateway's _platform_reconnect_watcher with the same
+        exponential backoff and circuit-breaker pattern.
+        """
+        await asyncio.sleep(10)  # initial delay - let startup finish
+        attempt = 0
+        while self._running:
+            # Check if any user has a dead ACP client
+            client = None
+            for user_id in list(self._session_mgr._clients.keys()):
+                c = self._session_mgr._clients.get(user_id)
+                if c and not c.alive:
+                    client = c
+                    break
+
+            if client is None:
+                # All clients alive or none - sleep and check again
+                attempt = 0
+                for _ in range(30):
+                    if not self._running:
+                        return
+                    await asyncio.sleep(1)
+                continue
+
+            # Dead ACP found - reconnect with backoff
+            attempt += 1
+            backoff = min(
+                self._ACP_RECONNECT_INITIAL_DELAY * (2 ** (attempt - 1)),
+                self._ACP_RECONNECT_BACKOFF_CAP,
+            )
+
+            logger.warning(
+                "[reconnect] ACP process dead (attempt %d/%d, next retry in %ds)",
+                attempt, self._ACP_RECONNECT_PAUSE_AFTER, backoff,
+            )
+
+            if attempt >= self._ACP_RECONNECT_PAUSE_AFTER:
+                logger.warning(
+                    "[reconnect] ACP reconnection paused after %d failed attempts. "
+                    "Gateway staying alive, will retry periodically.",
+                    attempt,
+                )
+                # Reset attempt counter and wait longer before retrying
+                attempt = 10  # stay at the circuit-breaker
+                backoff = self._ACP_RECONNECT_BACKOFF_CAP
+
+            try:
+                # Clean old dead clients
+                for user_id in list(self._session_mgr._clients.keys()):
+                    c = self._session_mgr._clients.get(user_id)
+                    if c and not c.alive:
+                        await c.stop()
+                        del self._session_mgr._clients[user_id]
+            except Exception:
+                pass
+
+            # Wait for backoff, checking every second if we should stop
+            for _ in range(int(backoff)):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
 
     # --- Message handling ---
 
