@@ -193,14 +193,18 @@ class SessionManager:
     def history(self) -> HistoryStore:
         return self._history
 
-    async def get_or_create_session(self, user_id: str) -> AcpClient:
-        """Get existing ACP client for user, or create a new one."""
+    async def get_or_create_session(self, user_id: str) -> tuple[AcpClient, bool]:
+        """Get existing ACP client for user, or create a new one.
+        Returns (client, was_recreated) — was_recreated=True means a new ACP
+        session was just started, so history should be injected.
+        """
         async with self._lock:
             client = self._clients.get(user_id)
             if client and client.alive:
-                return client
+                return client, False
 
             # Create new client
+            was_recreated = True
             client = AcpClient(self._acp_config)
             self._clients[user_id] = client
 
@@ -236,7 +240,7 @@ class SessionManager:
 
             logger.info("[session] Active: user=%s session=%s pid=%s",
                         user_id, session_id, state.acp_pid)
-            return client
+            return client, was_recreated
 
     async def send_message(self, user_id: str, text: str) -> str:
         """Send a message from WeChat user to their ACP session. Returns reply."""
@@ -244,15 +248,14 @@ class SessionManager:
         self._history.append(user_id, "user", text)
 
         # Get or create ACP client
-        client = await self.get_or_create_session(user_id)
+        client, was_recreated = await self.get_or_create_session(user_id)
 
-        # If this is a new session with history, inject summary first
-        meta = self._history.load_meta(user_id)
-        if meta.turn_count == 0:
-            summary = self._history.build_summary(user_id, max_turns=5)
+        # If session was just recreated (restart), inject history summary
+        if was_recreated:
+            summary = self._history.build_summary(user_id, max_turns=10)
             if summary:
-                # Prepend history summary to the first message
-                text = f"{summary}\n\n---\n\n当前消息：{text}"
+                text = f"{summary}\n\n---\n\n{text}"
+                logger.info("[session] Injected %d chars of history for %s", len(summary), user_id[:20])
 
         # Send prompt and collect response
         try:
@@ -262,7 +265,7 @@ class SessionManager:
             # Try to restart the session
             await self._restart_session(user_id)
             try:
-                client = await self.get_or_create_session(user_id)
+                client, _ = await self.get_or_create_session(user_id)
                 reply = await client.send_prompt(text)
             except Exception as exc2:
                 reply = f"抱歉，处理消息时出错：{exc2}"
@@ -271,6 +274,7 @@ class SessionManager:
         self._history.append(user_id, "assistant", reply)
 
         # Update meta
+        meta = self._history.load_meta(user_id)
         meta.turn_count += 1
         meta.updated_at = time.time()
         self._history.save_meta(meta)

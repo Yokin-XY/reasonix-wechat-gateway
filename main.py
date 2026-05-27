@@ -228,7 +228,7 @@ class ReasonixGateway:
 
         # Forward to Reasonix
         try:
-            client = await self._session_mgr.get_or_create_session(user_id)
+            client, _ = await self._session_mgr.get_or_create_session(user_id)
             typing_fn = lambda: asyncio.create_task(self._adapter.send_typing(chat_id)) if self._adapter else None
             progress_fn = (lambda t, c=chat_id: asyncio.create_task(self._adapter.send(c, t))) \
                 if self._verbose_progress and self._adapter else None
