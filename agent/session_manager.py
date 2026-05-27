@@ -188,6 +188,7 @@ class SessionManager:
         self._history = HistoryStore(sessions_dir)
         self._clients: Dict[str, AcpClient] = {}  # user_id → AcpClient
         self._lock = asyncio.Lock()
+        self._last_acp_session: str = ""  # tracks last ACP session for history injection
 
     @property
     def history(self) -> HistoryStore:
@@ -250,14 +251,19 @@ class SessionManager:
         # Get or create ACP client
         client, was_recreated = await self.get_or_create_session(user_id)
 
-        # Inject history summary on restart, or if this is a fresh session with history
-        meta = self._history.load_meta(user_id)
-        if was_recreated or meta.turn_count == 0:
+        # Inject history summary when ACP session changes (restart/new process)
+        current_session = client.session_id or ""
+        session_changed = current_session != self._last_acp_session
+        self._last_acp_session = current_session
+
+        if was_recreated or session_changed:
             summary = self._history.build_summary(user_id, max_turns=10)
             if summary:
                 text = f"【此前对话回顾】\n{summary}\n\n---\n\n{text}"
-                logger.info("[session] Injected %d chars history summary for %s (was_recreated=%s, turn_count=%s)",
-                            len(summary), user_id[:20], was_recreated, meta.turn_count)
+                logger.info("[session] Injected %d chars history (recreated=%s, session=%s..)",
+                            len(summary), was_recreated, current_session[:16])
+            else:
+                logger.info("[session] First session, no history")
 
         # Send prompt and collect response
         try:
