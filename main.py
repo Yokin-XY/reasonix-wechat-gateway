@@ -47,6 +47,7 @@ class ReasonixGateway:
         self._running = False
         self._verbose_progress = False
         self._monitor: ActivityMonitor | None = None
+        self._last_chat_id: str = ""
 
     async def start(self) -> None:
         """Start the gateway: connect WeChat adapter, begin processing."""
@@ -83,6 +84,15 @@ class ReasonixGateway:
         """Graceful shutdown."""
         logger.info("Shutting down gateway...")
         self._running = False
+        if self._monitor:
+            self._monitor.stop()
+        # Send shutdown notification to the last active chat
+        if self._adapter and self._last_chat_id:
+            try:
+                await self._adapter.send(self._last_chat_id,
+                                         "🔌 网关即将关闭。")
+            except Exception:
+                pass
         if self._adapter:
             await self._adapter.disconnect()
         await self._session_mgr.shutdown_all()
@@ -105,6 +115,9 @@ class ReasonixGateway:
         # If only media with no text, add a default prompt
         if not text and media_info:
             text = "用户发送了文件"
+
+        # Track last chat for shutdown notification
+        self._last_chat_id = chat_id
 
         logger.info("Message from %s: %s (media=%d)", user_id, text[:100], len(media_info))
 

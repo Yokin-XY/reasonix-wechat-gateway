@@ -329,7 +329,7 @@ class AcpClient:
 
     def _dispatch(self, msg: Dict[str, Any]) -> None:
         """Dispatch a parsed JSON-RPC message."""
-        # Response to a request (has id + result or error)
+        # Response to a request we sent (has id + result or error)
         if "id" in msg and ("result" in msg or "error" in msg):
             req_id = msg["id"]
             future = self._pending.pop(req_id, None)
@@ -343,10 +343,44 @@ class AcpClient:
                     future.set_result(msg.get("result", {}))
             return
 
+        # Incoming request from ACP (has method + id, needs a response)
+        if "method" in msg and "id" in msg:
+            self._handle_request(msg)
+            return
+
         # Notification (has method, no id)
         if "method" in msg:
             self._handle_notification(msg)
             return
+
+    def _handle_request(self, msg: Dict[str, Any]) -> None:
+        """Handle an incoming JSON-RPC request from the ACP process.
+
+        We must respond (with result or error) to keep the protocol alive.
+        """
+        method = msg["method"]
+        req_id = msg["id"]
+        params = msg.get("params", {})
+
+        if method == "session/request_permission":
+            # Auto-approve all permission requests (yolo mode)
+            logger.debug("[acp] Auto-approving permission request: %s",
+                         params.get("toolCall", {}).get("title", "?"))
+            response = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"outcome": {"optionId": "allow_once"}},
+            }
+            asyncio.ensure_future(self._write(response))
+        else:
+            # Unknown request method — reject
+            logger.warning("[acp] Unknown request: %s", method)
+            response = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"method not found: {method}"},
+            }
+            asyncio.ensure_future(self._write(response))
 
     def _handle_notification(self, msg: Dict[str, Any]) -> None:
         """Handle an ACP notification (session/update, etc.)."""
@@ -393,8 +427,8 @@ class AcpClient:
                 logger.debug("[acp] Tool update: %s", status)
 
         elif method == "session/request_permission":
-            # Auto-approve if yolo mode (shouldn't reach here normally)
-            logger.warning("[acp] Permission request (should be auto-approved in yolo mode)")
+            # Handled in _handle_request above — should never reach here
+            pass
 
     async def _send_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Send a JSON-RPC request and wait for the response."""

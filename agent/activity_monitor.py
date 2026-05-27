@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-CHECK_INTERVAL = 5        # check every 5 seconds
+CHECK_INTERVAL = 3        # check every 3 seconds
 ACTIVITY_TIMEOUT = 20     # stop typing if no activity for 20 seconds
 IDLE_TIMEOUT = 40         # stop monitoring entirely if idle for 40 seconds
 PROGRESS_INTERVAL = 30    # detailed progress every 30s (verbose mode)
