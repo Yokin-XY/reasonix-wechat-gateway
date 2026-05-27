@@ -27,7 +27,7 @@ from adapter.types import MessageEvent
 from agent.acp_client import AcpConfig
 from agent.session_manager import SessionManager
 from agent.command_handler import parse_command, handle_command
-from agent.progress_monitor import ProgressMonitor
+from agent.activity_monitor import ActivityMonitor
 
 logger = logging.getLogger("reasonix-gateway")
 
@@ -45,8 +45,8 @@ class ReasonixGateway:
         self._session_mgr = SessionManager(acp_config=acp_config)
         self._adapter: WeixinAdapter | None = None
         self._running = False
-        self._progress_chat_id: str = ""
-        self._progress = ProgressMonitor(send_fn=self._send_progress)
+        self._verbose_progress = False
+        self._monitor: ActivityMonitor | None = None
 
     async def start(self) -> None:
         """Start the gateway: connect WeChat adapter, begin processing."""
@@ -129,15 +129,23 @@ class ReasonixGateway:
 
         # Forward to Reasonix
         try:
-            # Set chat_id for progress reporting
-            self._progress_chat_id = chat_id
+            # Create activity monitor: default refreshes typing, verbose adds details
             client = await self._session_mgr.get_or_create_session(user_id)
-            self._progress.start_for(client)
+            typing_fn = lambda: asyncio.create_task(self._adapter.send_typing(chat_id)) if self._adapter else None
+            progress_fn = (lambda t, c=chat_id: asyncio.create_task(self._adapter.send(c, t))) \
+                if self._verbose_progress and self._adapter else None
+            self._monitor = ActivityMonitor(
+                typing_fn=typing_fn,
+                verbose=self._verbose_progress,
+                progress_fn=progress_fn,
+            )
+            self._monitor.start_for(client)
             reply = await self._session_mgr.send_message(user_id, text)
-            self._progress.stop()
+            self._monitor.stop()
             await self._send_reply(chat_id, reply)
         except Exception as exc:
-            self._progress.stop()
+            if self._monitor:
+                self._monitor.stop()
             logger.error("Error processing message from %s: %s", user_id, exc, exc_info=True)
             await self._send_reply(chat_id, f"处理消息时出错: {exc}")
 
@@ -175,16 +183,8 @@ class ReasonixGateway:
         return "\n".join(parts) if parts else ""
 
     def _send_progress(self, text: str) -> None:
-        """Send a progress message to WeChat (sync, fire-and-forget)."""
-        if not self._adapter or not self._progress_chat_id:
-            return
-        try:
-            # Fire-and-forget: progress shouldn't block main flow
-            asyncio.create_task(
-                self._adapter.send(self._progress_chat_id, text)
-            )
-        except Exception as exc:
-            logger.debug("[progress] send error: %s", exc)
+        """Send a progress message to WeChat (fire-and-forget, unused in default mode)."""
+        pass  # Progress text is sent via the lambda in _handle_message if verbose
 
     async def _send_reply(self, chat_id: str, text: str) -> None:
         """Send a reply via the WeChat adapter."""
@@ -223,6 +223,7 @@ async def main() -> None:
     parser.add_argument("--model", default="deepseek-v4-flash", help="Reasonix model")
     parser.add_argument("--effort", default="high", help="Reasoning effort")
     parser.add_argument("--dir", default="/root/reasonix-workspace", help="Reasonix workspace dir")
+    parser.add_argument("--verbose-progress", action="store_true", help="Send detailed progress (thinking/tool) instead of just typing")
     args = parser.parse_args()
 
     setup_logging()
@@ -278,6 +279,7 @@ async def main() -> None:
 
     # Start gateway
     gateway = ReasonixGateway(weixin_config, acp_config)
+    gateway._verbose_progress = args.verbose_progress
 
     # Handle signals
     loop = asyncio.get_event_loop()
