@@ -69,7 +69,35 @@ class ReasonixGateway:
             logger.error("Failed to connect WeChat adapter")
             return
 
+        # Send startup notification to last known user
+        await self._notify_startup()
+
         logger.info("Gateway started. Waiting for messages...")
+
+    def _chat_file(self) -> Path:
+        return Path(os.path.expanduser("~/.reasonix-gateway")) / "last-chat.txt"
+
+    def _save_last_chat(self, chat_id: str) -> None:
+        try:
+            self._chat_file().write_text(chat_id, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_last_chat(self) -> str:
+        try:
+            f = self._chat_file()
+            return f.read_text(encoding="utf-8").strip() if f.exists() else ""
+        except Exception:
+            return ""
+
+    async def _notify_startup(self) -> None:
+        """Send startup notification to the last known user."""
+        chat_id = self._load_last_chat()
+        if chat_id and self._adapter:
+            try:
+                await self._adapter.send(chat_id, "🟢 网关已重新启动，Reasonix 就绪。")
+            except Exception:
+                pass
 
         # Keep running until stopped
         try:
@@ -87,9 +115,10 @@ class ReasonixGateway:
         if self._monitor:
             self._monitor.stop()
         # Send shutdown notification to the last active chat
-        if self._adapter and self._last_chat_id:
+        chat_id = self._last_chat_id or self._load_last_chat()
+        if self._adapter and chat_id:
             try:
-                await self._adapter.send(self._last_chat_id,
+                await self._adapter.send(chat_id,
                                          "🔌 网关即将关闭。")
             except Exception:
                 pass
@@ -118,6 +147,8 @@ class ReasonixGateway:
 
         # Track last chat for shutdown notification
         self._last_chat_id = chat_id
+        # Persist to disk so startup notification works across restarts
+        self._save_last_chat(chat_id)
 
         logger.info("Message from %s: %s (media=%d)", user_id, text[:100], len(media_info))
 
