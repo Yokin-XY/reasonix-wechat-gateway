@@ -126,18 +126,6 @@ class HistoryStore:
         # Keep last max_turns * 2 entries (user + assistant pairs)
         return records[-(max_turns * 2):]
 
-    def build_summary(self, user_id: str, max_turns: int = 5) -> str:
-        """Build a brief history summary for injection into system prompt."""
-        history = self.load_history(user_id, max_turns=max_turns)
-        if not history:
-            return ""
-        parts = ["此前对话摘要："]
-        for msg in history:
-            role = "用户" if msg["role"] == "user" else "助手"
-            content = msg["content"][:150]
-            parts.append(f"{role}: {content}")
-        return "\n".join(parts)
-
     def save_meta(self, meta: SessionMeta) -> None:
         path = self._meta_path(meta.user_id)
         path.write_text(json.dumps(meta.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -183,29 +171,25 @@ class SessionManager:
         self,
         acp_config: Optional[AcpConfig] = None,
         sessions_dir: str = DEFAULT_SESSIONS_DIR,
+        session_name: str = "gw-0000",
     ):
         self._acp_config = acp_config or AcpConfig()
         self._history = HistoryStore(sessions_dir)
         self._clients: Dict[str, AcpClient] = {}  # user_id → AcpClient
         self._lock = asyncio.Lock()
-        self._last_acp_session: str = ""  # tracks last ACP session for history injection
+        self._session_name = session_name
 
     @property
     def history(self) -> HistoryStore:
         return self._history
 
-    async def get_or_create_session(self, user_id: str) -> tuple[AcpClient, bool]:
-        """Get existing ACP client for user, or create a new one.
-        Returns (client, was_recreated) — was_recreated=True means a new ACP
-        session was just started, so history should be injected.
-        """
+    async def get_or_create_session(self, user_id: str) -> AcpClient:
+        """Get existing ACP client for user, or create a new one."""
         async with self._lock:
             client = self._clients.get(user_id)
             if client and client.alive:
-                return client, False
+                return client
 
-            # Create new client
-            was_recreated = True
             client = AcpClient(self._acp_config)
             self._clients[user_id] = client
 
@@ -222,7 +206,10 @@ class SessionManager:
                 raise RuntimeError(f"Failed to start ACP for user {user_id}")
 
             # Create session
-            session_id = await client.new_session(self._acp_config.dir)
+            session_id = await client.new_session(
+                self._acp_config.dir,
+                session_name=self._session_name,
+            )
             if not session_id:
                 state.status = "error"
                 state.last_error = "Failed to create ACP session"
@@ -241,7 +228,7 @@ class SessionManager:
 
             logger.info("[session] Active: user=%s session=%s pid=%s",
                         user_id, session_id, state.acp_pid)
-            return client, was_recreated
+            return client
 
     async def send_message(self, user_id: str, text: str) -> str:
         """Send a message from WeChat user to their ACP session. Returns reply."""
@@ -249,21 +236,7 @@ class SessionManager:
         self._history.append(user_id, "user", text)
 
         # Get or create ACP client
-        client, was_recreated = await self.get_or_create_session(user_id)
-
-        # Inject history summary when ACP session changes (restart/new process)
-        current_session = client.session_id or ""
-        session_changed = current_session != self._last_acp_session
-        self._last_acp_session = current_session
-
-        if was_recreated or session_changed:
-            summary = self._history.build_summary(user_id, max_turns=10)
-            if summary:
-                text = f"【此前对话回顾】\n{summary}\n\n---\n\n{text}"
-                logger.info("[session] Injected %d chars history (recreated=%s, session=%s..)",
-                            len(summary), was_recreated, current_session[:16])
-            else:
-                logger.info("[session] First session, no history")
+        client = await self.get_or_create_session(user_id)
 
         # Send prompt and collect response
         try:
@@ -273,7 +246,7 @@ class SessionManager:
             # Try to restart the session
             await self._restart_session(user_id)
             try:
-                client, _ = await self.get_or_create_session(user_id)
+                client = await self.get_or_create_session(user_id)
                 reply = await client.send_prompt(text)
             except Exception as exc2:
                 reply = f"抱歉，处理消息时出错：{exc2}"

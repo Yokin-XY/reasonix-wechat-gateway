@@ -4,18 +4,21 @@ Reasonix Gateway — main entry point.
 Bridges WeChat (via iLink Bot API) to Reasonix (via ACP protocol).
 
 Usage:
-    python main.py                    # Start with default config
-    python main.py --config config.yaml  # Custom config
-    python main.py --login            # QR login for new WeChat account
+    python main.py                          # Start with default config
+    python main.py --account-id ... --token ...  # With credentials
+    python main.py --login                  # QR login for new WeChat account
 """
 
 from __future__ import annotations
 
 import asyncio
 import argparse
+import glob
 import logging
 import os
+import secrets
 import signal
+import string
 import sys
 from pathlib import Path
 
@@ -32,6 +35,55 @@ from agent.activity_monitor import ActivityMonitor
 logger = logging.getLogger("reasonix-gateway")
 
 
+SESSION_ID_FILE = os.path.expanduser("~/.reasonix-gateway/session-id")
+REASONIX_SESSIONS_DIR = os.path.expanduser("~/.reasonix/sessions")
+
+
+def _generate_unique_session_id() -> str:
+    """Generate a session ID that doesn't collide with existing Reasonix sessions.
+
+    1. Scan ~/.reasonix/sessions/ for all *.jsonl files
+    2. Extract their base names (strip .jsonl)
+    3. Generate a unique candidate that's not in the list
+    """
+    existing = set()
+    if os.path.isdir(REASONIX_SESSIONS_DIR):
+        for f in glob.glob(os.path.join(REASONIX_SESSIONS_DIR, "*.jsonl")):
+            name = os.path.basename(f)[:-6]  # strip .jsonl
+            existing.add(name)
+
+    for attempt in range(100):
+        # Generate ID like "gw-8f3a2c7b"
+        suffix = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+        candidate = f"gw-{suffix}"
+        if candidate not in existing:
+            return candidate
+
+    # Fallback — extremely unlikely to reach here
+    return f"gw-{int(__import__('time').time())}"
+
+
+def _resolve_session_id() -> tuple[str, bool]:
+    """Resolve the bound session ID.
+
+    Returns:
+        (session_id, is_restored) — is_restored=True means the binding file
+        already existed, so this is a recovery. False means first-time binding.
+    """
+    if os.path.exists(SESSION_ID_FILE):
+        session_id = Path(SESSION_ID_FILE).read_text(encoding="utf-8").strip()
+        if session_id:
+            logger.info("[session-id] Found binding: %s (restored)", session_id)
+            return session_id, True
+
+    # First time — generate a unique ID
+    session_id = _generate_unique_session_id()
+    Path(SESSION_ID_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(SESSION_ID_FILE).write_text(session_id, encoding="utf-8")
+    logger.info("[session-id] Generated new binding: %s", session_id)
+    return session_id, False
+
+
 class ReasonixGateway:
     """Main gateway class — connects WeChat adapter to Reasonix sessions."""
 
@@ -39,15 +91,22 @@ class ReasonixGateway:
         self,
         weixin_config: dict,
         acp_config: AcpConfig,
+        session_id: str = "gw-0000",
+        is_new_session: bool = False,
     ):
         self._weixin_config = weixin_config
         self._acp_config = acp_config
-        self._session_mgr = SessionManager(acp_config=acp_config)
+        self._session_mgr = SessionManager(
+            acp_config=acp_config,
+            session_name=session_id,
+        )
         self._adapter: WeixinAdapter | None = None
         self._running = False
         self._verbose_progress = False
         self._monitor: ActivityMonitor | None = None
         self._last_chat_id: str = ""
+        self._session_id = session_id
+        self._is_new_session = is_new_session
 
     async def start(self) -> None:
         """Start the gateway: connect WeChat adapter, begin processing."""
@@ -69,8 +128,8 @@ class ReasonixGateway:
             logger.error("Failed to connect WeChat adapter")
             return
 
-        # Send startup notification + pending shutdown delivery
-        await self._notify_startup()
+        # Send session notification
+        await self._notify_session()
 
         logger.info("Gateway started. Waiting for messages...")
 
@@ -83,14 +142,9 @@ class ReasonixGateway:
         finally:
             await self.shutdown()
 
-    # --- Lifecycle notification helpers ---
-
-    def _state_path(self) -> str:
-        """Path for lifecycle flags (shutdown/restart)."""
-        return os.path.expanduser("~/.reasonix-gateway/state.json")
+    # --- Session lifecycle notification ---
 
     def _last_chat_path(self) -> str:
-        """Path for persisted last chat ID."""
         return os.path.expanduser("~/.reasonix-gateway/last-chat.txt")
 
     def _save_last_chat(self, chat_id: str) -> None:
@@ -106,75 +160,35 @@ class ReasonixGateway:
         except Exception:
             return ""
 
-    def _save_shutdown_flag(self, chat_id: str) -> None:
-        """Write pending shutdown notification for delivery on next startup."""
-        try:
-            import json
-            Path(self._state_path()).write_text(
-                json.dumps({"type": "shutdown", "chat_id": chat_id, "text": "🔌 网关已关闭。"}),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-    def _clear_shutdown_flag(self) -> None:
-        try:
-            Path(self._state_path()).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    def _load_pending_notification(self) -> dict:
-        try:
-            import json
-            f = Path(self._state_path())
-            if f.exists():
-                return json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-        return {}
-
-    async def _notify_startup(self) -> None:
-        """Send startup notification. Also delivers pending shutdown from crash."""
-        # Deliver pending shutdown first
-        pending = self._load_pending_notification()
-        if pending.get("type") == "shutdown":
-            cid = pending.get("chat_id", "")
-            txt = pending.get("text", "🔌 网关已关闭。")
-            if cid and self._adapter:
-                try:
-                    await self._adapter.send(cid, txt)
-                except Exception:
-                    pass
-
-        # Then startup notification
+    async def _notify_session(self) -> None:
+        """Send session lifecycle notification to the last known chat."""
         chat_id = self._load_last_chat()
-        if chat_id and self._adapter:
-            try:
-                await self._adapter.send(chat_id, "🟢 网关已重新启动，Reasonix 就绪。")
-            except Exception:
-                pass
+        if not chat_id or not self._adapter:
+            return
+        try:
+            if self._is_new_session:
+                await self._adapter.send(chat_id, "🆕 已建立新的会话")
+            else:
+                await self._adapter.send(chat_id, "✅ 已恢复上一段会话")
+        except Exception:
+            pass
 
     async def shutdown(self) -> None:
-        """Graceful shutdown with bypass for crash delivery."""
+        """Graceful shutdown."""
         logger.info("Shutting down gateway...")
         self._running = False
         if self._monitor:
             self._monitor.stop()
 
-        # Save shutdown flag to file (bypass: delivered on next startup if we die)
         chat_id = self._last_chat_id or self._load_last_chat()
-        if chat_id:
-            self._save_shutdown_flag(chat_id)
-            # Try live send (3s timeout — may not complete if killed fast)
-            if self._adapter:
-                try:
-                    await asyncio.wait_for(
-                        self._adapter.send(chat_id, "🔌 网关即将关闭。"),
-                        timeout=3,
-                    )
-                    self._clear_shutdown_flag()
-                except Exception:
-                    logger.debug("[shutdown] live send failed, will deliver on next startup")
+        if chat_id and self._adapter:
+            try:
+                await asyncio.wait_for(
+                    self._adapter.send(chat_id, "🔌 网关已关闭"),
+                    timeout=3,
+                )
+            except Exception:
+                pass
 
         if self._adapter:
             await self._adapter.disconnect()
@@ -201,7 +215,7 @@ class ReasonixGateway:
         if not text and media_info:
             text = "用户发送了文件"
 
-        # Track last chat for shutdown notification
+        # Track last chat for session notification
         self._last_chat_id = chat_id
         self._save_last_chat(chat_id)
 
@@ -228,7 +242,7 @@ class ReasonixGateway:
 
         # Forward to Reasonix
         try:
-            client, _ = await self._session_mgr.get_or_create_session(user_id)
+            client = await self._session_mgr.get_or_create_session(user_id)
             typing_fn = lambda: asyncio.create_task(self._adapter.send_typing(chat_id)) if self._adapter else None
             progress_fn = (lambda t, c=chat_id: asyncio.create_task(self._adapter.send(c, t))) \
                 if self._verbose_progress and self._adapter else None
@@ -356,6 +370,9 @@ async def main() -> None:
         print("缺少微信凭证。请先运行: python main.py --login")
         return
 
+    # Resolve bound session ID (new or restored)
+    session_id, is_restored = _resolve_session_id()
+
     # ACP config
     system_append = args.prompt_suffix or (
         "输出规范：回复时只输出最终答案和结论，不要在回复中附带推理过程。"
@@ -371,8 +388,11 @@ async def main() -> None:
 
     Path(args.dir).mkdir(parents=True, exist_ok=True)
 
+    log_notice = "RESTORED" if is_restored else "NEW"
+    logger.info("Session ID: %s [%s]", session_id, log_notice)
+
     # Start gateway
-    gateway = ReasonixGateway(weixin_config, acp_config)
+    gateway = ReasonixGateway(weixin_config, acp_config, session_id=session_id, is_new_session=not is_restored)
     gateway._verbose_progress = args.verbose_progress
 
     # Handle signals

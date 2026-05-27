@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
@@ -91,7 +90,6 @@ class AcpClient:
             return None
 
         if idle_seconds > 120:
-            # No activity for 2+ minutes — might be stuck
             return "⏳ 已无响应" + (f"（上次活动: {int(idle_seconds)}秒前）")
 
         if self._progress_status == "running_tool" and self._current_tool:
@@ -142,17 +140,17 @@ class AcpClient:
 
         return True
 
-    async def new_session(self, cwd: Optional[str] = None, session_name: str = "wx-session") -> Optional[str]:
+    async def new_session(self, cwd=None, session_name="gw-0000"):
         """Create a new ACP session. Returns session_id or None on failure.
 
-        Uses a fixed session_name so Reasonix can resume the same session file
-        across gateway restarts (CacheFirstLoop.loadSessionMessages).
+        Uses the given session_name so Reasonix's CacheFirstLoop auto-loads
+        prior messages from ~/.reasonix/sessions/<session_name>.jsonl.
         """
         if not self.alive:
             logger.error("[acp] Not running, cannot create session")
             return None
 
-        params: Dict[str, Any] = {"sessionName": session_name}
+        params = {"sessionName": session_name}
         if cwd:
             params["cwd"] = cwd
 
