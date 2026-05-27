@@ -219,7 +219,7 @@ class ReasonixGateway:
         self._last_chat_id = chat_id
         self._save_last_chat(chat_id)
 
-        logger.info("Message from %s: %s (media=%d)", user_id, text[:100], len(media_info))
+        logger.info("Message from %s: %s (media=%d, session=%s)", user_id, text[:100], len(media_info), self._session_id)
 
         # Inject file paths into prompt
         if media_info:
@@ -258,7 +258,7 @@ class ReasonixGateway:
         except Exception as exc:
             if self._monitor:
                 self._monitor.stop()
-            logger.error("Error processing message from %s: %s", user_id, exc, exc_info=True)
+            logger.error("Error processing message from %s (session=%s): %s", user_id, self._session_id, exc, exc_info=True)
             await self._send_reply(chat_id, f"处理消息时出错: {exc}")
 
     def _collect_media(self, event: MessageEvent) -> str:
