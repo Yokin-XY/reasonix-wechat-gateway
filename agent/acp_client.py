@@ -142,13 +142,17 @@ class AcpClient:
 
         return True
 
-    async def new_session(self, cwd: Optional[str] = None) -> Optional[str]:
-        """Create a new ACP session. Returns session_id or None on failure."""
+    async def new_session(self, cwd: Optional[str] = None, session_name: str = "wx-session") -> Optional[str]:
+        """Create a new ACP session. Returns session_id or None on failure.
+
+        Uses a fixed session_name so Reasonix can resume the same session file
+        across gateway restarts (CacheFirstLoop.loadSessionMessages).
+        """
         if not self.alive:
             logger.error("[acp] Not running, cannot create session")
             return None
 
-        params: Dict[str, Any] = {}
+        params: Dict[str, Any] = {"sessionName": session_name}
         if cwd:
             params["cwd"] = cwd
 
