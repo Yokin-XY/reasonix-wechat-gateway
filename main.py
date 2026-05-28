@@ -419,7 +419,7 @@ async def main() -> None:
     parser.add_argument("--token", default="", help="WeChat iLink token")
     parser.add_argument("--model", default="deepseek-v4-flash", help="Reasonix model")
     parser.add_argument("--effort", default="high", help="Reasoning effort")
-    parser.add_argument("--dir", default="/root/reasonix-workspace", help="Reasonix workspace dir")
+    parser.add_argument("--dir", default="/workspace/.kf/toolchains/node-v24.15.0/lib/node_modules/reasonix/workspace", help="Reasonix workspace dir")
     parser.add_argument("--verbose-progress", action="store_true", help="Send detailed progress (thinking/tool) instead of just typing")
     parser.add_argument("--prompt-suffix", default="", help="Extra instruction appended to Reasonix system prompt")
     args = parser.parse_args()
