@@ -470,7 +470,7 @@ async def main() -> None:
     system_append = args.prompt_suffix or (
         "输出规范：回复时只输出最终答案和结论，不要在回复中附带推理过程。"
         "思考过程请放在 reasoning_content 中。回复简洁、直接。"
-        "工作目录规范：所有项目创建、构建、编译操作必须在 /root/ 目录下进行，"
+        "工作目录规范：工作台固定在 /root/ 目录下。所有项目创建、构建、编译操作必须在 /root/.reasonix-workspace/projects/ 下进行，"
         "禁止在 /workspace/、/exchange/、/chuan/、/xiangce/ 等共享目录下执行文件密集型操作。"
         "共享目录只用于文件交换，不适合大量读写。"
     )
